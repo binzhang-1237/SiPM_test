@@ -1,0 +1,8 @@
+/build/
+/data/
+/plots/
+/log/
+core
+core.*
+*.swp
+*~
