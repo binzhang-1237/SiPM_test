@@ -148,10 +148,10 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
             minuit.SetPrintLevel(-1);
             minuit.SetFCN(GaussianChi2);
             minuit.SetErrorDef(1.0); // chi-square: Delta chi2 = 1.
-            minuit.DefineParameter(0, "amplitude", result.amplitude, std::max(1.0, height * 0.01), 0, height * 10);
-            minuit.DefineParameter(1, "mean", result.mean, binWidth * 0.1, result.fitMin, result.fitMax);
-            minuit.DefineParameter(2, "sigma", result.sigma, binWidth * 0.1,
-                                   binWidth * 0.01, 10 * (result.fitMax - result.fitMin));
+            // Equal lower/upper limits (0, 0) leave each parameter unbounded in TMinuit.
+            minuit.DefineParameter(0, "amplitude", result.amplitude, std::max(1.0, height * 0.01), 0, 0);
+            minuit.DefineParameter(1, "mean", result.mean, binWidth * 0.1, 0, 0);
+            minuit.DefineParameter(2, "sigma", result.sigma, binWidth * 0.1, 0, 0);
             double arguments[2] = {5000, 0.01};
             minuit.mnexcm("MIGRAD", arguments, 2, result.status);
             int hesseStatus = 0;
