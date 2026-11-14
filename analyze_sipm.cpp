@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -494,9 +495,14 @@ int main(int argc, char **argv) {
     gROOT->SetBatch(true);
     gStyle->SetOptStat(1110);
 
-    // 1. Define three histograms: time in microseconds and PHA in ADC counts.
+    // 1. Define three histograms: time in seconds and PHA in ADC counts.
     //    Keep all 8192 ADC channels, with one channel per bin.
-    TH1D hTime("h_TStamp_us", "Trigger time;TStamp [#mus];Entries", 300, 0, 6.0e8);
+    TH1D hTime("h_TStamp_us", "Trigger time;TStamp [s];Entries / 2 s", 300, 0, 600);
+    // Resolve recorded bursts and gaps: 10-second window, 0.01-second bins.
+    TH1D hTimeFirst("h_TStamp_first10s", "Recorded events: first 10 s;TStamp [s];Trigger rates [kHz]",
+                    1000, 0, 10);
+    // Retain only the latest 10 seconds of timestamps, not the entire CSV.
+    std::deque<double> recentTimestamps;
     TH1D hLG("h_PHA_LG", "Low gain charge spectrum;PHA LG [ADC counts];Entries", 8192, -0.5, 8191.5);
     TH1D hHG("h_PHA_HG", "High gain charge spectrum;PHA HG [ADC counts];Entries", 8192, -0.5, 8191.5);
 
@@ -525,7 +531,11 @@ int main(int argc, char **argv) {
         }
 
         // 3. Fill the histograms with the values from this row.
-        hTime.Fill(time);
+        const double timeSeconds = time * 1e-6; // CSV timestamps are in microseconds.
+        hTime.Fill(timeSeconds);
+        if (timeSeconds >= 0 && timeSeconds < 10) hTimeFirst.Fill(timeSeconds);
+        recentTimestamps.push_back(timeSeconds);
+        while (recentTimestamps.front() < timeSeconds - 10) recentTimestamps.pop_front();
         hLG.Fill(phaLG);
         hHG.Fill(phaHG);
         ++entries;
@@ -533,6 +543,16 @@ int main(int argc, char **argv) {
     if (entries == 0) {
         std::cerr << "No data rows in: " << inputPath << '\n';
         return 1;
+    }
+
+    // Anchor the final window to the last recorded timestamp, not the preset run duration.
+    const double lastWindowEnd = std::max(10.0, recentTimestamps.back());
+    const double lastWindowStart = lastWindowEnd - 10;
+    TH1D hTimeLast("h_TStamp_last10s", "Recorded events: last 10 s;TStamp [s];Trigger rates [kHz]",
+                   1000, lastWindowStart, lastWindowEnd);
+    for (double timestamp : recentTimestamps) {
+        // ROOT excludes the upper axis edge; include the final event in the last bin.
+        hTimeLast.Fill(std::min(timestamp, std::nextafter(lastWindowEnd, lastWindowStart)));
     }
 
     // Find and fit peaks in the full HG and LG spectra before zooming the plot axes.
@@ -557,6 +577,11 @@ int main(int argc, char **argv) {
     TCanvas canvas("canvas", "SiPM test", 1100, 750);
     canvas.SetLeftMargin(0.12);
     canvas.SetBottomMargin(0.13);
+    // Keep the overview as raw counts per 2-second bin. Convert only the
+    // first/last 10-second plots to recorded rates in kHz.
+    hTimeFirst.Scale(1.0 / (hTimeFirst.GetBinWidth(1) * 1000));
+    hTimeLast.Scale(1.0 / (hTimeLast.GetBinWidth(1) * 1000));
+
     // Draw and save the timestamp histogram separately. No fit or log axis.
     canvas.SetLogy(false);
     hTime.SetLineWidth(2);
@@ -569,7 +594,30 @@ int main(int argc, char **argv) {
               << ", underflow=" << hTime.GetBinContent(0)
               << ", overflow=" << hTime.GetBinContent(hTime.GetNbinsX() + 1) << '\n';
 
-    // Draw the charge histograms below, independently of the timestamp plot.
+    // Draw the first 10 seconds with 0.01-second bins.
+    canvas.Clear();
+    canvas.SetLogy(false);
+    hTimeFirst.SetLineColor(kBlack);
+    hTimeFirst.SetLineWidth(2);
+    hTimeFirst.SetMinimum(0);
+    hTimeFirst.Draw("HIST");
+    canvas.SaveAs((prefix + "_TStamp_first10s.png").c_str());
+    canvas.SaveAs((prefix + "_TStamp_first10s.pdf").c_str());
+    hTimeFirst.Write();
+
+    // Draw the final 10 seconds using the same bin width and linear y axis.
+    canvas.Clear();
+    hTimeLast.SetLineColor(kBlack);
+    hTimeLast.SetLineWidth(2);
+    hTimeLast.SetMinimum(0);
+    hTimeLast.Draw("HIST");
+    canvas.SaveAs((prefix + "_TStamp_last10s.png").c_str());
+    canvas.SaveAs((prefix + "_TStamp_last10s.pdf").c_str());
+    hTimeLast.Write();
+    std::cout << "Final time window: [" << lastWindowStart << ", " << lastWindowEnd
+              << "] s, entries=" << hTimeLast.GetEntries() << '\n';
+
+    // Draw the charge histograms below, independently of the timestamp plots.
     TLegend legend(0.60, 0.46, 0.89, 0.84);
     legend.SetBorderSize(0);
     legend.SetFillStyle(0);
