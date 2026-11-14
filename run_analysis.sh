@@ -15,5 +15,6 @@ echo "Started: $(date --iso-8601=seconds)"
 echo "Input: $input_file"
 echo "Output: $output_dir"
 bash "$script_dir/build.sh"
+rm $output_dir/*
 
 exec "$script_dir/build/analyze_sipm" "$input_file" "$output_dir"

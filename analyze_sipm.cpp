@@ -1,9 +1,11 @@
 #include <TCanvas.h>
+#include <TColor.h>
 #include <TF1.h>
 #include <TFile.h>
 #include <TGraphErrors.h>
 #include <TH1D.h>
 #include <TList.h>
+#include <TLegend.h>
 #include <TMinuit.h>
 #include <TROOT.h>
 #include <TSpectrum.h>
@@ -24,13 +26,14 @@ struct PeakFitResult {
     double peakPosition = 0;
     double fitMin = 0, fitMax = 0;
     double initialSigma = 0;
-    double rangeMean = 0, rangeSigma = 0; // Pre-fit parameters: the final range is rangeMean +/- 2*rangeSigma.
+    double rangeMean = 0, rangeSigma = 0; // Pre-fit parameters: the final range is rangeMean +/- 1.5*rangeSigma.
     double amplitude = std::numeric_limits<double>::quiet_NaN();
     double mean = std::numeric_limits<double>::quiet_NaN();
     double sigma = std::numeric_limits<double>::quiet_NaN();
     double amplitudeError = 0;
     double meanError = 0;        // Mean uncertainty from TMinuit/HESSE, distinct from the peak width sigma.
     double sigmaError = 0;       // Fit uncertainty of the peak width sigma.
+    double meanSigmaCovariance = 0; // Covariance used to propagate sigma/mean uncertainty.
     double chi2 = std::numeric_limits<double>::quiet_NaN();
     int ndf = 0;
     int status = -1;             // MIGRAD: 0 means convergence; -1 means the fit has not been performed.
@@ -41,6 +44,7 @@ struct PeakFitResult {
 namespace {
 TH1 *fitHistogram = nullptr;
 int fitFirstBin = 0, fitLastBin = 0;
+// int fitPeakCount = 0; // Global fitting is temporarily disabled.
 
 void GaussianChi2(int &, double *, double &chi2, double *parameters, int) {
     chi2 = 0;
@@ -54,13 +58,35 @@ void GaussianChi2(int &, double *, double &chi2, double *parameters, int) {
         chi2 += (y - model) * (y - model) / variance;
     }
 }
+
+// Sum of fitPeakCount Gaussian peaks plus B*exp(-x/tau).
+// Global fitting is temporarily disabled.
+// void MultiGaussianChi2(int &, double *, double &chi2, double *parameters, int) {
+//     chi2 = 0;
+//     for (int bin = fitFirstBin; bin <= fitLastBin; ++bin) {
+//         const double x = fitHistogram->GetBinCenter(bin);
+//         const double backgroundAmplitude = parameters[3 * fitPeakCount];
+//         const double decayLength = parameters[3 * fitPeakCount + 1];
+//         if (decayLength == 0) { chi2 = 1e100; return; }
+//         double model = backgroundAmplitude * std::exp(-x / decayLength);
+//         if (!std::isfinite(model)) { chi2 = 1e100; return; }
+//         for (int peak = 0; peak < fitPeakCount; ++peak) {
+//             if (parameters[3 * peak + 2] == 0) { chi2 = 1e100; return; }
+//             const double z = (x - parameters[3 * peak + 1]) / parameters[3 * peak + 2];
+//             model += parameters[3 * peak] * std::exp(-0.5 * z * z);
+//         }
+//         const double error = fitHistogram->GetBinError(bin);
+//         const double residual = fitHistogram->GetBinContent(bin) - model;
+//         chi2 += residual * residual / (error > 0 ? error * error : 1.0);
+//     }
+// }
 }
 
-// Find peaks, estimate mu and sigma in the half-height range, then fit within mu +/- 2*sigma.
+// Find peaks, estimate mu and sigma in the half-height range, then fit within mu +/- 1.5*sigma.
 // Return only converged fits with reliable errors, sorted by increasing fitted mean.
-std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
+std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram, std::vector<double> *candidatePositions = nullptr) {
     const int maxPeaks = histogram.GetNbinsX();
-    const double sigma = 2.0;       // Peak-search width parameter in bins.
+    const double sigma = 8.0;       // Peak-search width parameter in bins.
     const double searchThreshold = 1.0e-6; // Loose candidate-search threshold; do not impose a 5% peak-height cut.
     const double minimumPeakCounts = 100; // Require the raw bin count at each candidate position to be strictly greater than 100.
     std::vector<double> positions;
@@ -77,6 +103,10 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
         }
         std::sort(positions.begin(), positions.end());
     }
+    if (candidatePositions) *candidatePositions = positions;
+    std::cout << histogram.GetName() << " candidate positions (>100 raw bin counts):";
+    for (double position : positions) std::cout << " " << position;
+    std::cout << '\n';
 
     for (double position : positions) {
         PeakFitResult result;
@@ -134,8 +164,8 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
             if (pass == 1) {
                 result.rangeMean = result.mean;
                 result.rangeSigma = result.sigma;
-                result.fitMin = std::max(histogram.GetXaxis()->GetXmin(), result.rangeMean - 2 * result.rangeSigma);
-                result.fitMax = std::min(histogram.GetXaxis()->GetXmax(), result.rangeMean + 2 * result.rangeSigma);
+                result.fitMin = std::max(histogram.GetXaxis()->GetXmin(), result.rangeMean - 1.5 * result.rangeSigma);
+                result.fitMax = std::min(histogram.GetXaxis()->GetXmax(), result.rangeMean + 1.5 * result.rangeSigma);
                 fitFirstBin = std::max(1, histogram.FindFixBin(result.fitMin));
                 fitLastBin = std::min(histogram.GetNbinsX(), histogram.FindFixBin(result.fitMax));
                 if (histogram.GetBinCenter(fitFirstBin) < result.fitMin) ++fitFirstBin;
@@ -159,6 +189,9 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
             minuit.GetParameter(0, result.amplitude, result.amplitudeError);
             minuit.GetParameter(1, result.mean, result.meanError);
             minuit.GetParameter(2, result.sigma, result.sigmaError);
+            double covariance[9] = {};
+            minuit.mnemat(covariance, 3);
+            result.meanSigmaCovariance = covariance[1 * 3 + 2];
             double edm = 0, errorDefinition = 0;
             int variableParameters = 0, totalParameters = 0;
             minuit.mnstat(result.chi2, edm, errorDefinition, variableParameters, totalParameters, result.covarianceStatus);
@@ -187,6 +220,7 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
             curve->SetChisquare(result.chi2);
             curve->SetNDF(result.ndf);
             curve->SetLineColor(kRed);
+            curve->SetBit(TF1::kNotDraw); // Retain individual fits without drawing them.
             histogram.GetListOfFunctions()->Add(curve);
         }
     }
@@ -211,6 +245,151 @@ std::vector<PeakFitResult> FindAndFitPeaks(TH1 &histogram) {
     return results;
 }
 
+// Keep the independent fits above; use them only as seeds for a simultaneous fit.
+// Stop the simultaneous fit at the last seed mean plus 1.5 seed sigmas.
+// Global fitting is temporarily disabled.
+// std::vector<PeakFitResult> FitMultipleGaussians(
+//     TH1 &histogram, const std::vector<PeakFitResult> &individualFits) {
+//     // Use every successful independent fit; no manually selected peak count.
+//     const auto &seeds = individualFits;
+//     const int peakCount = static_cast<int>(seeds.size());
+//     if (seeds.empty()) {
+//         std::cout << histogram.GetName() << ": no independent fits available for the global fit\n";
+//         return {};
+//     }
+//
+//     const double fitMin = histogram.GetXaxis()->GetXmin();
+//     const double fitMax = std::min(histogram.GetXaxis()->GetXmax(),
+//                                    seeds.back().mean + 1.5 * seeds.back().sigma);
+//     fitHistogram = &histogram;
+//     fitPeakCount = peakCount;
+//     fitFirstBin = 1;
+//     fitLastBin = std::min(histogram.GetNbinsX(), histogram.FindFixBin(fitMax));
+//     if (histogram.GetBinCenter(fitLastBin) > fitMax) --fitLastBin;
+//     const int parameterCount = 3 * peakCount + 2;
+//     const int ndf = fitLastBin - fitFirstBin + 1 - parameterCount;
+//     if (ndf <= 0) return {};
+//     TMinuit minuit(parameterCount);
+//     minuit.SetPrintLevel(-1);
+//     minuit.SetFCN(MultiGaussianChi2);
+//     minuit.SetErrorDef(1.0);
+//     for (int peak = 0; peak < peakCount; ++peak) {
+//         const auto &seed = seeds[peak];
+//         std::cout << histogram.GetName() << " global seed " << peak
+//                   << ": A=" << seed.amplitude << ", mean=" << seed.mean << ", sigma=" << seed.sigma << '\n';
+//         minuit.DefineParameter(3 * peak, Form("A%d", peak), seed.amplitude,
+//                                std::max(1.0, seed.amplitude * 0.01), 0, 0);
+//         minuit.DefineParameter(3 * peak + 1, Form("mean%d", peak), seed.mean, 0.1, 0, 0);
+//         minuit.DefineParameter(3 * peak + 2, Form("sigma%d", peak), seed.sigma, 0.1, 0, 0);
+//     }
+//     const double backgroundInitial = std::max(1.0, histogram.GetMaximum() * 0.1);
+//     const double decayInitial = (fitMax - fitMin) / 2;
+//     minuit.DefineParameter(3 * peakCount, "background_B", backgroundInitial,
+//                            std::max(1.0, backgroundInitial * 0.01), 0, 0);
+//     minuit.DefineParameter(3 * peakCount + 1, "decay_tau", decayInitial, decayInitial * 0.01, 0, 0);
+//     double arguments[2] = {60000, 0.01};
+//     int status = 0, hesseStatus = 0;
+//     minuit.mnexcm("MIGRAD", arguments, 2, status);
+//     minuit.mnexcm("HESSE", arguments, 1, hesseStatus);
+//     double chi2 = 0, edm = 0, errorDefinition = 0;
+//     int nVariable = 0, nTotal = 0, covarianceStatus = 0;
+//     minuit.mnstat(chi2, edm, errorDefinition, nVariable, nTotal, covarianceStatus);
+//     std::cout << histogram.GetName() << " global " << peakCount << "-Gaussian + exponential fit: status=" << status
+//               << ", HESSE=" << hesseStatus << ", covariance=" << covarianceStatus
+//               << ", chi2/ndf=" << chi2 << "/" << ndf
+//               << ", range=[" << fitMin << ", " << fitMax << "]\n";
+//     if (!std::isfinite(chi2)) return {};
+//     const bool fitSucceeded = status == 0 && hesseStatus == 0 && covarianceStatus == 3;
+//     if (!fitSucceeded)
+//         std::cout << "WARNING: global fit did not converge reliably; draw the current model only,"
+//                      " and do not return it as a successful fit\n";
+//
+//     const std::string name = std::string(histogram.GetName()) + "_multi_gaussians";
+//     std::string formula;
+//     for (int peak = 0; peak < peakCount; ++peak) {
+//         if (peak > 0) formula += "+";
+//         formula += "gaus(" + std::to_string(3 * peak) + ")";
+//     }
+//     formula += "+[" + std::to_string(3 * peakCount) + "]*exp(-x/["
+//              + std::to_string(3 * peakCount + 1) + "])";
+//     auto *total = new TF1(name.c_str(), formula.c_str(), fitMin, fitMax);
+//     total->SetNpx(8192);
+//     for (int parameter = 0; parameter < parameterCount; ++parameter) {
+//         double value = 0, error = 0;
+//         minuit.GetParameter(parameter, value, error);
+//         if (!std::isfinite(value)) { delete total; return {}; }
+//         total->SetParameter(parameter, value);
+//         total->SetParError(parameter, error);
+//     }
+//     total->SetChisquare(chi2);
+//     total->SetNDF(ndf);
+//     total->SetLineColor(kBlue + 1);
+//     total->SetLineWidth(3);
+//     total->SetTitle(Form("%d Gaussians + exponential%s", peakCount, fitSucceeded ? "" : " (not converged)"));
+//     histogram.GetListOfFunctions()->Add(total);
+//
+//     std::vector<double> covariance(parameterCount * parameterCount);
+//     minuit.mnemat(covariance.data(), parameterCount);
+//
+//     // Decompose the simultaneous model, not the earlier independent fits.
+//     // Use peakCount signal curves plus one exponential-background curve.
+//     for (int component = 0; component <= peakCount; ++component) {
+//         const std::string componentName = name + "_component_" + std::to_string(component);
+//         TF1 *curve = nullptr;
+//         if (component < peakCount) {
+//             curve = new TF1(componentName.c_str(), "gaus", fitMin, fitMax);
+//             curve->SetParameters(total->GetParameter(3 * component),
+//                                  total->GetParameter(3 * component + 1),
+//                                  total->GetParameter(3 * component + 2));
+//             curve->SetTitle(Form("Signal %d", component));
+//             curve->SetLineStyle(2);
+//         } else {
+//             curve = new TF1(componentName.c_str(), "[0]*exp(-x/[1])", fitMin, fitMax);
+//             curve->SetParameters(total->GetParameter(3 * peakCount), total->GetParameter(3 * peakCount + 1));
+//             curve->SetTitle("Exponential background");
+//             curve->SetLineStyle(7);
+//         }
+//         Float_t red = 0, green = 0, blue = 0;
+//         TColor::HSV2RGB(360.0f * component / (peakCount + 1), 0.85f, 0.75f, red, green, blue);
+//         curve->SetLineColor(TColor::GetColor(red, green, blue));
+//         curve->SetLineWidth(2);
+//         curve->SetNpx(4096);
+//         histogram.GetListOfFunctions()->Add(curve);
+//     }
+//
+//     std::vector<PeakFitResult> results;
+//     for (int peak = 0; peak < peakCount; ++peak) {
+//         PeakFitResult result;
+//         result.peakPosition = seeds[peak].peakPosition;
+//         result.amplitude = total->GetParameter(3 * peak);
+//         result.amplitudeError = total->GetParError(3 * peak);
+//         result.mean = total->GetParameter(3 * peak + 1);
+//         result.meanError = total->GetParError(3 * peak + 1);
+//         result.sigma = std::abs(total->GetParameter(3 * peak + 2));
+//         result.sigmaError = total->GetParError(3 * peak + 2);
+//         result.meanSigmaCovariance = covariance[(3 * peak + 1) * parameterCount + 3 * peak + 2]
+//                                   * std::copysign(1.0, total->GetParameter(3 * peak + 2));
+//         result.fitMin = total->GetXmin();
+//         result.fitMax = total->GetXmax();
+//         result.chi2 = chi2;
+//         result.ndf = total->GetNDF();
+//         result.status = status;
+//         result.covarianceStatus = covarianceStatus;
+//         results.push_back(result);
+//         std::cout << "  Global peak " << peak << ": A=" << result.amplitude << " +/- " << result.amplitudeError
+//                   << ", mean=" << result.mean << " +/- " << result.meanError
+//                   << ", sigma=" << result.sigma << " +/- " << result.sigmaError << '\n';
+//     }
+//     std::cout << "  Background B=" << total->GetParameter(3 * peakCount)
+//               << " +/- " << total->GetParError(3 * peakCount)
+//               << ", tau=" << total->GetParameter(3 * peakCount + 1)
+//               << " +/- " << total->GetParError(3 * peakCount + 1) << " ADC counts\n";
+//     if (total->GetParameter(3 * peakCount) <= 0 || total->GetParameter(3 * peakCount + 1) <= 0)
+//         std::cout << "WARNING: unconstrained background parameters do not describe a positive decaying background\n";
+//     if (!fitSucceeded) return {};
+//     return results;
+// }
+
 // Plot the returned peak-fit results with indices starting at zero.
 // Indices enumerate retained peaks; missing or duplicate peaks prevent an absolute p.e. interpretation.
 void PlotPeakResults(const std::vector<PeakFitResult> &peaks, const std::string &prefix,
@@ -219,13 +398,13 @@ void PlotPeakResults(const std::vector<PeakFitResult> &peaks, const std::string 
         std::cout << gain << ": no successful fits, skipping peak-index plots\n";
         return;
     }
-    TGraphErrors meanGraph, sigmaGraph;
+    TGraphErrors meanGraph, resolutionGraph;
     meanGraph.SetName(("g_" + gain + "_mean_vs_index").c_str());
-    sigmaGraph.SetName(("g_" + gain + "_sigma_vs_index").c_str());
+    resolutionGraph.SetName(("g_" + gain + "_resolution_vs_nPEs").c_str());
     meanGraph.SetTitle((gain + ": fitted mean;" + (gain == "HG" ? "nPEs" : "Peak index (starting at 0)")
                         + ";Mean [ADC counts]").c_str());
-    sigmaGraph.SetTitle((gain + ": fitted sigma;Peak index (starting at 0);Sigma [ADC counts]").c_str());
-    const size_t meanPointCount = gain == "HG" ? std::min(size_t(6), peaks.size()) : peaks.size();
+    resolutionGraph.SetTitle((gain + ": relative resolution;nPEs;Relative resolution #sigma/#mu [%]").c_str());
+    const size_t meanPointCount = peaks.size();
     for (size_t i = 0; i < peaks.size(); ++i) {
         if (i < meanPointCount) {
             meanGraph.SetPoint(i, i, peaks[i].mean);
@@ -234,15 +413,29 @@ void PlotPeakResults(const std::vector<PeakFitResult> &peaks, const std::string 
             std::cout << gain << " mean graph point: index=" << i
                       << ", mean=" << peaks[i].mean << ", y_error=" << peaks[i].meanError << '\n';
         }
-        sigmaGraph.SetPoint(i, i, peaks[i].sigma);
-        sigmaGraph.SetPointError(i, 0, peaks[i].sigmaError);
+        // Resolution uses the raw fitted mean, without pedestal subtraction.
+        // Propagate both parameter errors and their covariance for R=100*sigma/mean.
+        if (peaks[i].mean > 0) {
+            const double resolution = 100 * peaks[i].sigma / peaks[i].mean;
+            const double derivativeSigma = 100 / peaks[i].mean;
+            const double derivativeMean = -100 * peaks[i].sigma / (peaks[i].mean * peaks[i].mean);
+            const double variance = std::pow(derivativeSigma * peaks[i].sigmaError, 2)
+                                  + std::pow(derivativeMean * peaks[i].meanError, 2)
+                                  + 2 * derivativeSigma * derivativeMean * peaks[i].meanSigmaCovariance;
+            const double resolutionError = std::sqrt(std::max(0.0, variance));
+            const int point = resolutionGraph.GetN();
+            resolutionGraph.SetPoint(point, i, resolution);
+            resolutionGraph.SetPointError(point, 0, resolutionError);
+            std::cout << gain << " resolution point: nPEs=" << i << ", sigma/mean="
+                      << resolution << " +/- " << resolutionError << " percent\n";
+        }
     }
     TCanvas canvas("peak_canvas", "Peak fit results", 1100, 750);
     canvas.SetLeftMargin(0.12);
     canvas.SetBottomMargin(0.13);
     meanGraph.SetMarkerStyle(20);
     meanGraph.Draw("AP");
-    // For HG, plot the first six peaks (nPEs=0..5) and exclude the first from the linear fit.
+    // Plot all successful peaks and exclude the first from the HG linear fit.
     TF1 linearFit("hg_mean_linear", "[0]+[1]*x", 1, meanPointCount - 1);
     TPaveText fitText(0.15, 0.66, 0.61, 0.89, "NDC");
     if (gain == "HG" && meanPointCount >= 4) {
@@ -265,7 +458,7 @@ void PlotPeakResults(const std::vector<PeakFitResult> &peaks, const std::string 
         fitText.SetTextFont(42);
         fitText.SetTextSize(0.028);
         fitText.AddText("Mean = intercept + slope #times nPEs");
-        fitText.AddText("Weighted fit, nPEs = 1..5; errors: #delta#mu");
+        fitText.AddText(Form("Weighted fit, nPEs = 1..%zu; errors: #delta#mu", meanPointCount - 1));
         fitText.AddText(Form("Intercept = %.3f #pm %.3f ADC counts", linearFit.GetParameter(0), linearFit.GetParError(0)));
         fitText.AddText(Form("Slope = %.3f #pm %.3f ADC counts/p.e.", linearFit.GetParameter(1), linearFit.GetParError(1)));
         fitText.AddText(Form("#chi^{2}/ndf = %.2f / %d", linearFit.GetChisquare(), linearFit.GetNDF()));
@@ -276,11 +469,15 @@ void PlotPeakResults(const std::vector<PeakFitResult> &peaks, const std::string 
     canvas.SaveAs((prefix + "_PHA_" + gain + "_mean_vs_index.pdf").c_str());
     meanGraph.Write();
     canvas.Clear();
-    sigmaGraph.SetMarkerStyle(20);
-    sigmaGraph.Draw("AP");
-    canvas.SaveAs((prefix + "_PHA_" + gain + "_sigma_vs_index.png").c_str());
-    canvas.SaveAs((prefix + "_PHA_" + gain + "_sigma_vs_index.pdf").c_str());
-    sigmaGraph.Write();
+    if (resolutionGraph.GetN() > 0) {
+        resolutionGraph.SetMarkerStyle(20);
+        resolutionGraph.Draw("AP");
+        canvas.SaveAs((prefix + "_PHA_" + gain + "_resolution_vs_nPEs.png").c_str());
+        canvas.SaveAs((prefix + "_PHA_" + gain + "_resolution_vs_nPEs.pdf").c_str());
+        resolutionGraph.Write();
+    }
+    std::filesystem::remove(prefix + "_PHA_" + gain + "_sigma_vs_index.png");
+    std::filesystem::remove(prefix + "_PHA_" + gain + "_sigma_vs_index.pdf");
 }
 
 int main(int argc, char **argv) {
@@ -339,15 +536,19 @@ int main(int argc, char **argv) {
     }
 
     // Find and fit peaks in the full HG and LG spectra before zooming the plot axes.
-    const std::vector<PeakFitResult> peaksLG = FindAndFitPeaks(hLG);
+    // const std::vector<PeakFitResult> peaksLG = FindAndFitPeaks(hLG);
     const std::vector<PeakFitResult> peaksHG = FindAndFitPeaks(hHG);
 
-    // 4. Save each plot as PNG and PDF, and save the complete histograms in a ROOT file.
+    // Simultaneous fits supplement, rather than replace, the individual fits.
+    // const auto globalPeaksLG = FitMultipleGaussians(hLG, peaksLG);
+    // const auto globalPeaksHG = FitMultipleGaussians(hHG, peaksHG);
+
+    // 4. Save charge spectra with linear/logarithmic y axes and preserve all fit functions.
     //    Zoom only the displayed PHA range; all 8192 bins remain available.
     hLG.GetXaxis()->SetRangeUser(-0.5, 499.5);
     hHG.GetXaxis()->SetRangeUser(-0.5, 999.5);
-    TH1D *histograms[3] = {&hTime, &hLG, &hHG};
-    const char *names[3] = {"TStamp_us", "PHA_LG", "PHA_HG"};
+    TH1D *chargeHistograms[2] = {&hLG, &hHG};
+    const char *chargeNames[2] = {"PHA_LG", "PHA_HG"};
     TFile output((prefix + "_histograms.root").c_str(), "RECREATE");
     if (output.IsZombie()) {
         std::cerr << "Cannot create ROOT output\n";
@@ -356,21 +557,123 @@ int main(int argc, char **argv) {
     TCanvas canvas("canvas", "SiPM test", 1100, 750);
     canvas.SetLeftMargin(0.12);
     canvas.SetBottomMargin(0.13);
-    for (int i = 0; i < 3; ++i) {
-        histograms[i]->SetLineWidth(2);
-        histograms[i]->Draw(i >= 1 ? "" : "HIST");
-        canvas.SaveAs((prefix + "_" + names[i] + ".png").c_str());
-        canvas.SaveAs((prefix + "_" + names[i] + ".pdf").c_str());
-        // Use the full range in the ROOT file and the zoomed range in the images.
-        histograms[i]->GetXaxis()->SetRange(0, 0);
-        histograms[i]->Write();
-        std::cout << names[i] << ": entries=" << histograms[i]->GetEntries()
-                  << ", underflow=" << histograms[i]->GetBinContent(0)
-                  << ", overflow=" << histograms[i]->GetBinContent(histograms[i]->GetNbinsX() + 1)
+    // Draw and save the timestamp histogram separately. No fit or log axis.
+    canvas.SetLogy(false);
+    hTime.SetLineWidth(2);
+    hTime.SetLineColor(kBlack);
+    hTime.Draw("HIST");
+    canvas.SaveAs((prefix + "_TStamp_us.png").c_str());
+    canvas.SaveAs((prefix + "_TStamp_us.pdf").c_str());
+    hTime.Write();
+    std::cout << "TStamp_us: entries=" << hTime.GetEntries()
+              << ", underflow=" << hTime.GetBinContent(0)
+              << ", overflow=" << hTime.GetBinContent(hTime.GetNbinsX() + 1) << '\n';
+
+    // Draw the charge histograms below, independently of the timestamp plot.
+    TLegend legend(0.60, 0.46, 0.89, 0.84);
+    legend.SetBorderSize(0);
+    legend.SetFillStyle(0);
+    legend.SetTextSize(0.027);
+    // Each charge histogram produces independent-fit images on linear and log axes.
+    // The global-fit view is temporarily disabled.
+    for (int chargeIndex = 0; chargeIndex < 2; ++chargeIndex) {
+        TH1D &histogram = *chargeHistograms[chargeIndex];
+        const std::string histogramLabel = chargeNames[chargeIndex];
+        histogram.SetLineWidth(2);
+        histogram.SetLineColor(kBlack);
+
+        // Select the fit overlay: 0 = independent peaks, 1 = global model.
+        for (int fitViewIndex = 0; fitViewIndex < 1; ++fitViewIndex) {
+
+            // Select the vertical axis: 0 = linear, 1 = logarithmic.
+            for (int yAxisScaleIndex = 0; yAxisScaleIndex < 2; ++yAxisScaleIndex) {
+                const bool useLogYAxis = yAxisScaleIndex == 1;
+
+                // 1. Clear the previous plot, configure the axis, and draw data.
+                // HIST suppresses automatic drawing of attached fit functions;
+                // the selected curves are added explicitly below using SAME.
+                canvas.Clear();
+                canvas.SetLogy(useLogYAxis);
+                histogram.SetMinimum(useLogYAxis ? 0.5 : 0);
+                histogram.Draw("HIST");
+                legend.Clear();
+
+                legend.AddEntry(&histogram, "Data", "l");
+                if (fitViewIndex == 0) {
+                    // 2a. Overlay the individual Gaussian fits. Their saved
+                    // names start at 1 and form a consecutive sequence.
+                    for (int independentPeakNumber = 1; ; ++independentPeakNumber) {
+                        const std::string fitName = std::string(histogram.GetName())
+                            + "_gaussian_" + std::to_string(independentPeakNumber);
+                        auto *independentCurve = histogram.GetFunction(fitName.c_str());
+                        if (!independentCurve) break;
+                        independentCurve->ResetBit(TF1::kNotDraw);
+                        independentCurve->Draw("SAME");
+                        if (independentPeakNumber == 1)
+                            legend.AddEntry(independentCurve, "Independent Gaussian fits", "l");
+                    }
+
+                }
+                // else {
+                //     // 2b. Overlay the global model's signal and background
+                //     // components, then draw the total fit above them.
+                //     const std::string totalFitName = std::string(histogram.GetName()) + "_multi_gaussians";
+                //     auto *totalFit = histogram.GetFunction(totalFitName.c_str());
+                //     if (totalFit) {
+                //         // Each Gaussian has three parameters; the exponential
+                //         // background has two. Component N is the background.
+                //         const int numberOfSignalPeaks = (totalFit->GetNpar() - 2) / 3;
+                //         for (int componentIndex = 0; componentIndex <= numberOfSignalPeaks; ++componentIndex) {
+                //             const std::string componentName = totalFitName
+                //                 + "_component_" + std::to_string(componentIndex);
+                //             if (auto *componentCurve = histogram.GetFunction(componentName.c_str())) {
+                //                 componentCurve->Draw("SAME");
+                //                 legend.AddEntry(componentCurve, componentCurve->GetTitle(), "l");
+                //             }
+                //         }
+                //         totalFit->Draw("SAME");
+                //         legend.AddEntry(totalFit, totalFit->GetTitle(), "l");
+                //     } else {
+                //         // LG fitting is disabled, so its global view shows
+                //         // only the charge data and this explanatory entry.
+                //         legend.AddEntry(static_cast<TObject *>(nullptr), "Global fit unavailable", "");
+                //     }
+                // }
+                legend.Draw();
+
+                // 3. Save the selected fit/scale combination as PNG and PDF.
+                // Example: Run94_list_PHA_HG_individual_log.png.
+                std::string imageSuffix;
+                imageSuffix = fitViewIndex == 0 ? "_individual" : "_global";
+                imageSuffix += useLogYAxis ? "_log" : "_linear";
+                const std::string imagePath = prefix + "_" + histogramLabel + imageSuffix;
+                canvas.SaveAs((imagePath + ".png").c_str());
+                canvas.SaveAs((imagePath + ".pdf").c_str());
+            }
+        }
+
+        // Keep independent fits in the ROOT file, but disable their automatic
+        // display so they do not get mixed with the global-fit components.
+        for (int independentPeakNumber = 1; ; ++independentPeakNumber) {
+            const std::string fitName = std::string(histogram.GetName())
+                + "_gaussian_" + std::to_string(independentPeakNumber);
+            auto *independentCurve = histogram.GetFunction(fitName.c_str());
+            if (!independentCurve) break;
+            independentCurve->SetBit(TF1::kNotDraw);
+        }
+
+        // 5. Save the complete histogram and attached functions to the ROOT file.
+        // Reset the display zoom so every stored ADC bin remains visible.
+        histogram.SetMinimum(0);
+        histogram.GetXaxis()->SetRange(0, 0);
+        histogram.Write();
+        std::cout << histogramLabel << ": entries=" << histogram.GetEntries()
+                  << ", underflow=" << histogram.GetBinContent(0)
+                  << ", overflow=" << histogram.GetBinContent(histogram.GetNbinsX() + 1)
                   << '\n';
     }
     // 5. Plot mean and sigma versus index with uncertainties from the successful fits.
-    PlotPeakResults(peaksLG, prefix, "LG");
+    // PlotPeakResults(peaksLG, prefix, "LG");
     PlotPeakResults(peaksHG, prefix, "HG");
     output.Close();
     std::cout << "Processed " << entries << " rows. Output: " << outputDir << '\n';
